@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-# bot.py - versión parcheada con aislamiento de sesiones y robustez
+# bot_optimizado_fixed.py - versión parcheada con aislamiento de sesiones y robustez
+# PATCHED: persistencia de STRING_SESSION en disco, detección de sesiones no autorizadas
+# y guardado periódico de session para sobrevivir reinicios en entornos en la nube.
+
 import os, re, json, random, asyncio, unicodedata, traceback
 from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Set, List
@@ -11,6 +14,13 @@ from logging.handlers import RotatingFileHandler
 from filelock import FileLock
 
 load_dotenv()
+
+# ------------------ nueva excepción ------------------
+class UnauthorizedSession(Exception):
+    """Raised when a session (StringSession or file) is not authorized and should not be retried."""
+    pass
+
+# ------------------ helpers ------------------
 
 def sg(k: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(k, default)
@@ -27,7 +37,7 @@ APPEND_HANDLE_TO_FORWARDS = (sg("APPEND_HANDLE_TO_FORWARDS") or "false").lower()
 FORWARD_ONLY_MEDIA = (sg("FORWARD_ONLY_MEDIA") or "true").lower() in ("1","true","yes")
 
 # Palabras, mensajes, logs
-PALABRAS_CLAVE = [k.strip() for k in (sg("PALABRAS_CLAVE") or "Arbol genealogico,titularidad,reniec,acta de nacimiento,seguidores,dox,ayuda,info").split(",") if k.strip()]
+PALABRAS_CLAVE = [k.strip() for k in (sg("PALABRAS_CLAVE") or "Arbol genealogico,titularidad,reniec,acta de nacimiento,seguidores,dox,ayuda,info,quien").split(",") if k.strip()]
 MSG_GRUPO = sg("MSG_GRUPO") or f"👋 {{mention}}, bienvenido al grupo. Escríbeme por privado: {AT_HANDLE}"
 MSG_KEYWORD = sg("MSG_KEYWORD") or f"📌 {{mention}}, tengo justo lo que buscas. Escríbeme: {AT_HANDLE}"
 MSG_PRIVADO = sg("MSG_PRIVADO") or f"oyee vi tu mensaje en el grupo, que estas buscando?"
@@ -49,7 +59,7 @@ if EXPLICIT_TARGET_FILE and os.path.exists(EXPLICIT_TARGET_FILE):
         data = json.load(open(EXPLICIT_TARGET_FILE, 'r', encoding='utf-8'))
         for i in data: EXPLICIT_TARGET_CHAT_IDS.add(int(i))
     except Exception: pass
-EXCLUDE_TARGET_GROUPS: List[str] = [g.strip().lower() for g in (sg("EXCLUDE_TARGET_GROUPS") or "Publicidad de spam").split(",") if g.strip()]
+EXCLUDE_TARGET_GROUPS: List[str] = [g.strip().lower() for g in (sg("EXCLUDE_TARGET_GROUPS") or "publicidad de spam").split(",") if g.strip()]
 EXCLUDE_TARGET_IDS: Set[int] = set()
 try:
     for x in (sg("EXCLUDE_TARGET_IDS") or "").split(","):
@@ -93,9 +103,9 @@ FAST_REPLY_WINDOW_SECONDS = int(sg("FAST_REPLY_WINDOW_SECONDS") or 60*60*24)
 AUTO_REPLY_COOLDOWN_SECONDS = int(sg("AUTO_REPLY_COOLDOWN_SECONDS") or 300)
 
 # Simultaneous responders
-WELCOME_SIMULTANEOUS = int(sg("WELCOME_SIMULTANEOUS") or 5)
+WELCOME_SIMULTANEOUS = int(sg("WELCOME_SIMULTANEOUS") or 2)
 KEYWORD_SIMULTANEOUS = int(sg("KEYWORD_SIMULTANEOUS") or 2)
-PRIVATE_SIMULTANEOUS = int(sg("PRIVATE_SIMULTANEOUS") or 2)
+PRIVATE_SIMULTANEOUS = int(sg("PRIVATE_SIMULTANEOUS") or 1)
 
 # coordinación compartida
 GLOBAL_SHARED_FILE = sg("GLOBAL_SHARED_FILE") or "global_responses.json"
@@ -252,7 +262,7 @@ def _label_for_user_obj(obj, uid_fallback: Optional[int] = None) -> str:
 
 # sessions/utils
 ENV_FILE = os.getenv("ENV_FILE", ".env")
-MAX_ACCOUNTS = int(sg("MAX_ACCOUNTS") or 11)
+MAX_ACCOUNTS = int(sg("MAX_ACCOUNTS") or 20)
 SESSION_PREFIX = os.getenv("SESSION_PREFIX", "bot.session")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -304,20 +314,48 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
         return
     digits = re.sub(r'[^0-9]', '', phone)
 
-    # --- IMPORTANT: use explicit per-account STRING_SESSION{idx} only (no global fallback)
-    session_env = os.getenv(f"STRING_SESSION{idx}")  # do NOT fallback to STRING_SESSION global
-    using_string_session = bool(session_env)
-
     # prepare file session path to allow deletion on invalidation
     session_path = os.path.join(SESSIONS_DIR, f"{SESSION_PREFIX}-{digits}.session")
     os.makedirs(SESSIONS_DIR, exist_ok=True)
 
+    # ---------- nueva lógica: persistir STRING_SESSION en archivo dentro de SESSIONS_DIR ----------
+    string_session_file = os.path.join(SESSIONS_DIR, f"STRING_SESSION{idx}.string")
+
+    # asegurar variable definida para evitar NameError en finally
+    session_save_task = None
+
+    session_env = None
+    if os.path.exists(string_session_file):
+        try:
+            with open(string_session_file, 'r', encoding='utf-8') as f:
+                t = f.read().strip()
+                if t:
+                    session_env = t
+        except Exception:
+            session_env = None
+
+    if not session_env:
+        env_val = os.getenv(f"STRING_SESSION{idx}")
+        if env_val:
+            session_env = env_val.strip()
+            try:
+                tmp = string_session_file + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f: f.write(session_env)
+                os.replace(tmp, string_session_file)
+                logger.info(f"[{nombre}] Persistida STRING_SESSION{idx} en {string_session_file}")
+            except Exception:
+                logger.debug(f"[{nombre}] No se pudo persistir STRING_SESSION{idx} en archivo")
+
     if session_env:
         client = TelegramClient(StringSession(session_env), api_id, api_hash)
+        using_string_session = True
     else:
         client = TelegramClient(session_path, api_id, api_hash)
+        using_string_session = False
+
     tlg_logger = SimpleTelegramLogger(client)
 
+    # tareas/estado locales
     paused_until = None; paused_forwarding_until = None
     usuarios_no_contactable: Dict[int, datetime] = {}
     usuarios_auto_respondidos: Dict[int, datetime] = {}
@@ -398,53 +436,110 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
     # autosave periódico
     async def autosave_state_loop():
         nonlocal last_forwarded, sent_counts
-        while True:
-            try:
-                save_last_forwarded(last_forwarded)
-                save_sent_counts(sent_counts)
-            except Exception:
-                logger.debug(f"[{nombre}] autosave fallo: {traceback.format_exc()}")
-            await asyncio.sleep(SAVE_STATE_INTERVAL)
+        try:
+            while True:
+                try:
+                    save_last_forwarded(last_forwarded)
+                    save_sent_counts(sent_counts)
+                except Exception:
+                    logger.debug(f"[{nombre}] autosave fallo: {traceback.format_exc()}")
+                await asyncio.sleep(SAVE_STATE_INTERVAL)
+        except asyncio.CancelledError:
+            return
+
+    # periodic session saver (persistir client.session.save() en archivo)
+    async def periodic_session_save(interval=300):
+        try:
+            while True:
+                try:
+                    try:
+                        s = client.session.save()
+                    except Exception:
+                        s = None
+                    if s:
+                        try:
+                            tmpf = string_session_file + ".tmp"
+                            with open(tmpf, 'w', encoding='utf-8') as f:
+                                f.write(s)
+                            os.replace(tmpf, string_session_file)
+                            logger.debug(f"[{nombre}] session persistida ({len(s)} chars)")
+                        except Exception:
+                            logger.debug(f"[{nombre}] no se pudo persistir session a file")
+                except Exception as e:
+                    logger.debug(f"[{nombre}] periodic_session_save error: {e}")
+                await asyncio.sleep(max(120, SAVE_STATE_INTERVAL))
+        except asyncio.CancelledError:
+            return
 
     # keepalive para detectar sesión invalidada
     async def keepalive_check():
         await asyncio.sleep(random.uniform(0, STAGGER_RANDOM_JITTER + 5))
-        while True:
-            try:
-                await client.get_me()
-            except Exception as e:
-                m = str(e).lower()
-                logger.debug(f"[{nombre}] Keepalive resultado: {m}")
-                if "auth_key_unregistered" in m or "unauthorized" in m or "not authorized" in m or ("session" in m and "invalid" in m):
-                    logger.warning(f"[{nombre}] Keepalive detectó problema de sesión: {e}")
-                    try:
-                        await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • Sesión invalidada/expirada: {e}", force=True)
-                    except Exception:
-                        pass
-                    # eliminar archivo de sesión local para evitar reusar sesión corrupta
-                    if not using_string_session:
+        try:
+            while True:
+                try:
+                    await client.get_me()
+                except Exception as e:
+                    m = str(e).lower()
+                    logger.debug(f"[{nombre}] Keepalive resultado: {m}")
+                    if "auth_key_unregistered" in m or "unauthorized" in m or "not authorized" in m or ("session" in m and "invalid" in m):
+                        logger.warning(f"[{nombre}] Keepalive detectó problema de sesión: {e}")
                         try:
-                            if os.path.exists(session_path):
-                                os.remove(session_path)
-                                logger.info(f"[{nombre}] Archivo de session eliminado: {session_path}")
+                            await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • Sesión invalidada/expirada: {e}", force=True)
                         except Exception:
-                            logger.debug(f"[{nombre}] No se pudo eliminar session file: {traceback.format_exc()}")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    return
-                else:
-                    logger.debug(f"[{nombre}] Keepalive error no crítico: {e}")
-            sleep_for = KEEPALIVE_INTERVAL * random.uniform(0.8, 1.2)
-            await asyncio.sleep(sleep_for)
+                            pass
+                        # eliminar archivo de sesión local para evitar reusar sesión corrupta
+                        if not using_string_session:
+                            try:
+                                if os.path.exists(session_path):
+                                    os.remove(session_path)
+                                    logger.info(f"[{nombre}] Archivo de session eliminado: {session_path}")
+                            except Exception:
+                                logger.debug(f"[{nombre}] No se pudo eliminar session file: {traceback.format_exc()}")
+                        # eliminar string persistida también
+                        try:
+                            if os.path.exists(string_session_file):
+                                os.remove(string_session_file)
+                                logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                        except Exception:
+                            pass
 
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+
+                        # lanzar excepción para que el runner lo gestione (no reintentar infinito)
+                        raise UnauthorizedSession(f"Keepalive: sesión invalidada para {nombre}: {e}")
+                    else:
+                        logger.debug(f"[{nombre}] Keepalive error no crítico: {e}")
+                sleep_for = KEEPALIVE_INTERVAL * random.uniform(0.8, 1.2)
+                await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            return
+
+    # Conectar
     await client.connect()
+
+    # Si la cuenta no está autorizada -> lanzar UnauthorizedSession para que el runner deje de intentar
     if not await client.is_user_authorized():
         logger.warning(f"[{nombre}] Sesión no autorizada, revisa STRING_SESSION{idx} o inicia interactivamente.")
         try: await client.disconnect()
         except: pass
-        return
+        # borrar string persistida si existe para forzar regeneración manual
+        try:
+            if os.path.exists(string_session_file):
+                os.remove(string_session_file)
+                logger.info(f"[{nombre}] Archivo STRING_SESSION removido (no autorizado): {string_session_file}")
+        except Exception:
+            pass
+        raise UnauthorizedSession(f"Session invalid or revoked for {nombre} (idx={idx})")
+
+    # iniciar tarea que persiste la session periódicamente (si tenemos path)
+    try:
+        if string_session_file:
+            session_save_task = asyncio.create_task(periodic_session_save())
+    except Exception:
+        session_save_task = None
 
     # Estado inicial
     me = await client.get_me(); me_id = getattr(me, 'id', None); known_account_ids.add(me_id)
@@ -893,6 +988,11 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
         except: pass
         try: runner_forward.cancel()
         except: pass
+        try:
+            if session_save_task:
+                session_save_task.cancel()
+        except:
+            pass
         try: await tlg_logger.send(LOGS_CHANNEL, f"{account_label} • BOT detenido", force=True)
         except: pass
         try: await client.disconnect()
@@ -911,6 +1011,10 @@ async def runner_wrapper(api_id, api_hash, phone, nombre, known_account_ids, idx
             wait = int(base * jitter)
             logger.warning(f"[Main] {nombre} terminó. Reintentando en {wait}s (retry={retries})")
             await asyncio.sleep(wait)
+        except UnauthorizedSession as ue:
+            # Sesión inválida permanente: no reintentar. El operador debe regenerar la session.
+            logger.error(f"[Main] {nombre}: sesión inválida/expirada: {ue}. Dejo de reintentar. (Requiere acción manual)")
+            return
         except Exception as e:
             retries += 1
             base = min(2 ** min(retries, 12), 21600)
