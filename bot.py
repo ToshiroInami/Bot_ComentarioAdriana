@@ -38,7 +38,7 @@ FORWARD_ONLY_MEDIA = (sg("FORWARD_ONLY_MEDIA") or "true").lower() in ("1","true"
 
 # Palabras, mensajes, logs
 PALABRAS_CLAVE = [k.strip() for k in (sg("PALABRAS_CLAVE") or "Arbol genealogico,titularidad,reniec,acta de nacimiento,seguidores,dox,ayuda,info,quien").split(",") if k.strip()]
-MSG_GRUPO = sg("MSG_GRUPO") or f"👋 {{mention}}, bienvenido al grupo. Escríbeme por privado: {AT_HANDLE}"
+MSG_GRUPO = sg("MSG_GRUPO") or f"👋 {{mention}}, bienvenido al grupo, Tengo lo que buscas. Escríbeme por privado: {AT_HANDLE}"
 MSG_KEYWORD = sg("MSG_KEYWORD") or f"📌 {{mention}}, tengo justo lo que buscas. Escríbeme: {AT_HANDLE}"
 MSG_PRIVADO = sg("MSG_PRIVADO") or f"oyee vi tu mensaje en el grupo, que estas buscando?"
 MSG_AUTO = sg("MSG_AUTO") or f"Escríbeme a mi cuenta principal: {AT_HANDLE} - aquí estoy activo"
