@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# bot_optimizado_fixed.py - versión parcheada con aislamiento de sesiones y robustez
-# PATCHED: persistencia de STRING_SESSION en disco, detección de sesiones no autorizadas
-# y guardado periódico de session para sobrevivir reinicios en entornos en la nube.
+# bot_optimizado_fixed_with_global_blocks.py - versión parcheada con bloqueo GLOBAL por destino
+# Incluye: persistencia de STRING_SESSION, detección de sesiones no autorizadas,
+# persistencia de bloqueos por destino LOCALES y GLOBALES para evitar cascadas FloodWait.
 
 import os, re, json, random, asyncio, unicodedata, traceback
 from datetime import datetime, timedelta, date
@@ -11,7 +11,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from logging import getLogger, StreamHandler, Formatter, INFO
 from logging.handlers import RotatingFileHandler
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 load_dotenv()
 
@@ -69,16 +69,16 @@ except Exception:
     EXCLUDE_TARGET_IDS = set()
 
 # timing & limits
-STAGGER_STEP_SECONDS = float(sg("STAGGER_STEP_SECONDS") or 30.0)
+STAGGER_STEP_SECONDS = float(sg("STAGGER_STEP_SECONDS") or 10.0)
 STAGGER_RANDOM_JITTER = float(sg("STAGGER_RANDOM_JITTER") or 15.0)
-FORWARD_LAST_N = int(sg("FORWARD_LAST_N") or 5)
+FORWARD_LAST_N = int(sg("FORWARD_LAST_N") or 3)
 FORWARDS_PER_ROUND = int(sg("FORWARDS_PER_ROUND") or FORWARD_LAST_N)
-PER_PUB_DELAY_MIN = float(sg("PER_PUB_DELAY_MIN") or 50.0)
-PER_PUB_DELAY_MAX = float(sg("PER_PUB_DELAY_MAX") or 80.0)
-POST_ROUND_DELAY_MIN = float(sg("POST_ROUND_DELAY_MIN") or 50.0)
-POST_ROUND_DELAY_MAX = float(sg("POST_ROUND_DELAY_MAX") or 80.0)
+PER_PUB_DELAY_MIN = float(sg("PER_PUB_DELAY_MIN") or 30.0)
+PER_PUB_DELAY_MAX = float(sg("PER_PUB_DELAY_MAX") or 40.0)
+POST_ROUND_DELAY_MIN = float(sg("POST_ROUND_DELAY_MIN") or 40.0)
+POST_ROUND_DELAY_MAX = float(sg("POST_ROUND_DELAY_MAX") or 45.0)
 
-RESEND_COOLDOWN_SECONDS = int(sg("RESEND_COOLDOWN_SECONDS") or 220)
+RESEND_COOLDOWN_SECONDS = int(sg("RESEND_COOLDOWN_SECONDS") or 100)
 CHAT_DAILY_LIMIT = int(sg("CHAT_DAILY_LIMIT") or 10000)
 MAX_PUBS_PER_CHAT = int(sg("MAX_PUBS_PER_CHAT") or 5)
 GLOBAL_MAX_CONCURRENT_FORWARDS = int(sg("GLOBAL_MAX_CONCURRENT_FORWARDS") or 8)
@@ -92,8 +92,8 @@ FORWARD_ACCOUNT_MIN_INTERVAL = float(sg("FORWARD_ACCOUNT_MIN_INTERVAL") or 0.0)
 KEYWORD_USER_COOLDOWN_SECONDS = int(sg("KEYWORD_USER_COOLDOWN_SECONDS") or 120)
 
 # Replies
-WELCOME_DELAY_MIN = float(sg("WELCOME_DELAY_MIN") or 3.0)
-WELCOME_DELAY_MAX = float(sg("WELCOME_DELAY_MAX") or 11.0)
+WELCOME_DELAY_MIN = float(sg("WELCOME_DELAY_MIN") or 0.1)
+WELCOME_DELAY_MAX = float(sg("WELCOME_DELAY_MAX") or 2.0)
 KEYWORD_REPLY_DELAY_MIN = float(sg("KEYWORD_REPLY_DELAY_MIN") or 3.0)
 KEYWORD_REPLY_DELAY_MAX = float(sg("KEYWORD_REPLY_DELAY_MAX") or 10.0)
 PRIVATE_REPLY_DELAY_MIN = float(sg("PRIVATE_REPLY_DELAY_MIN") or 6.0)
@@ -103,8 +103,8 @@ FAST_REPLY_WINDOW_SECONDS = int(sg("FAST_REPLY_WINDOW_SECONDS") or 60*60*24)
 AUTO_REPLY_COOLDOWN_SECONDS = int(sg("AUTO_REPLY_COOLDOWN_SECONDS") or 300)
 
 # Simultaneous responders
-WELCOME_SIMULTANEOUS = int(sg("WELCOME_SIMULTANEOUS") or 2)
-KEYWORD_SIMULTANEOUS = int(sg("KEYWORD_SIMULTANEOUS") or 2)
+WELCOME_SIMULTANEOUS = int(sg("WELCOME_SIMULTANEOUS") or 3)
+KEYWORD_SIMULTANEOUS = int(sg("KEYWORD_SIMULTANEOUS") or 1)
 PRIVATE_SIMULTANEOUS = int(sg("PRIVATE_SIMULTANEOUS") or 1)
 
 # coordinación compartida
@@ -120,6 +120,11 @@ BASE_PAUSE_EXTRA_SEC = int(sg("BASE_PAUSE_EXTRA_SEC") or 10)
 SAVE_STATE_INTERVAL = int(sg("SAVE_STATE_INTERVAL") or 120)
 KEEPALIVE_INTERVAL = int(sg("KEEPALIVE_INTERVAL") or 1200)
 MIN_PAUSE_ON_FWD = int(sg("MIN_PAUSE_ON_FWD") or 5)
+SUSPEND_SECONDS = int(sg("SUSPEND_SECONDS") or (6 * 3600))  # 6 horas por defecto si se excede flood_count
+
+# GLOBAL BLOCKS FILE (compartido entre todas las cuentas en el mismo filesystem)
+GLOBAL_BLOCKS_FILE = sg("GLOBAL_BLOCKS_FILE") or "global_blocks.json"
+GLOBAL_BLOCKS_LOCK = GLOBAL_BLOCKS_FILE + ".lock"
 
 # logger
 logger = getLogger("bot_optimizado")
@@ -186,6 +191,68 @@ def _write_shared(d: Dict[str, List[str]]):
         except Exception:
             pass
 
+# GLOBAL blocks helpers (para bloqueo compartido por destino)
+def _read_global_blocks() -> Dict[str, str]:
+    try:
+        if not os.path.exists(GLOBAL_BLOCKS_FILE):
+            return {}
+        with FileLock(GLOBAL_BLOCKS_LOCK):
+            with open(GLOBAL_BLOCKS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): v for k, v in raw.items() if isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+def _write_global_blocks(d: Dict[str, str]):
+    try:
+        now = datetime.now()
+        clean = {}
+        for k, iso in d.items():
+            try:
+                t = datetime.fromisoformat(iso)
+                if t > now:
+                    clean[str(k)] = iso
+            except Exception:
+                continue
+        with FileLock(GLOBAL_BLOCKS_LOCK):
+            tmp = GLOBAL_BLOCKS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(clean, f, ensure_ascii=False)
+            os.replace(tmp, GLOBAL_BLOCKS_FILE)
+    except Exception:
+        pass
+
+
+def get_global_block_for_dest(cid: int) -> Optional[datetime]:
+    try:
+        blocks = _read_global_blocks()
+        iso = blocks.get(str(cid))
+        if not iso: return None
+        return datetime.fromisoformat(iso)
+    except Exception:
+        return None
+
+
+def set_global_block_for_dest(cid: int, wait_seconds: int, max_cap_seconds: Optional[int] = None):
+    try:
+        now = datetime.now()
+        margin = int(max(5, wait_seconds * 0.10))
+        jitter = int(random.uniform(1, 4))
+        total = int(wait_seconds) + margin + jitter
+        if max_cap_seconds:
+            total = min(total, int(max_cap_seconds))
+        until = now + timedelta(seconds=total)
+        blocks = _read_global_blocks()
+        blocks[str(cid)] = until.isoformat()
+        _write_global_blocks(blocks)
+        logger.debug(f"GLOBAL: set block for {cid} until {until} (raw_wait={wait_seconds})")
+    except Exception:
+        logger.debug(f"No se pudo setear global block para {cid}")
+
+
 def has_recent_shared_response(key: str, window_seconds: int, max_allowed: int = 1) -> bool:
     try:
         data = _read_shared(); vals = data.get(key, [])
@@ -200,6 +267,7 @@ def has_recent_shared_response(key: str, window_seconds: int, max_allowed: int =
         return count >= max_allowed
     except Exception:
         return False
+
 
 def register_shared_response(key: str):
     try:
@@ -357,6 +425,11 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
     # tareas/estado locales
     paused_until = None; paused_forwarding_until = None
+    # NEW: paused_blocks persistirá bloqueo por DEST (chat_id) -> iso timestamp
+    paused_blocks: Dict[str, str] = {}
+    # NEW: account metadata persisted
+    account_meta = {"flood_count": 0, "flood_window_start": None, "suspended_until": None}
+
     usuarios_no_contactable: Dict[int, datetime] = {}
     usuarios_auto_respondidos: Dict[int, datetime] = {}
     usuarios_esperando_respuesta: Dict[int, datetime] = {}
@@ -366,9 +439,9 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
     paused_file = f"paused_{digits}.json"; last_forwarded_file = f"last_forwarded_{digits}.json"; sent_counts_file = f"sent_counts_{digits}.json"
 
-    # estado persistente cargado/guardado
+    # estado persistente cargado/guardado (AHORA con paused_blocks y account_meta)
     def load_paused():
-        nonlocal paused_until, paused_forwarding_until
+        nonlocal paused_until, paused_forwarding_until, paused_blocks, account_meta, flood_count, flood_window_start
         try:
             if os.path.exists(paused_file):
                 with open(paused_file, 'r', encoding='utf-8') as f:
@@ -379,13 +452,37 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                 if j.get('paused_forwarding_until'):
                     dt = datetime.fromisoformat(j['paused_forwarding_until']);
                     if dt > datetime.now(): paused_forwarding_until = dt
+                # cargar bloques por destino
+                pb = j.get('blocks', {})
+                if isinstance(pb, dict):
+                    paused_blocks = {str(k): v for k, v in pb.items() if isinstance(v, str)}
+                # cargar account_meta si existe
+                am = j.get('account_meta', {})
+                account_meta['flood_count'] = int(am.get('flood_count', 0))
+                account_meta['flood_window_start'] = am.get('flood_window_start')
+                account_meta['suspended_until'] = am.get('suspended_until')
+                # restore flood_count/window if present
+                try:
+                    if account_meta.get('flood_window_start'):
+                        flood_window_start = datetime.fromisoformat(account_meta['flood_window_start'])
+                    flood_count = int(account_meta.get('flood_count', 0))
+                except Exception:
+                    flood_count = int(account_meta.get('flood_count', 0) or 0)
         except Exception:
             pass
+
     def save_paused():
         try:
             out = {}
             if paused_until: out['paused_until'] = paused_until.isoformat()
             if paused_forwarding_until: out['paused_forwarding_until'] = paused_forwarding_until.isoformat()
+            if paused_blocks:
+                out['blocks'] = {k: v for k, v in paused_blocks.items()}
+            out['account_meta'] = {
+                'flood_count': int(account_meta.get('flood_count', 0)),
+                'flood_window_start': account_meta.get('flood_window_start'),
+                'suspended_until': account_meta.get('suspended_until')
+            }
             tmp = paused_file + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f: json.dump(out, f, ensure_ascii=False)
             os.replace(tmp, paused_file)
@@ -433,6 +530,28 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
         except Exception:
             pass
 
+    # helper: obtener bloqueo por destino (datetime)
+    def get_block_for_dest(cid: int) -> Optional[datetime]:
+        try:
+            iso = paused_blocks.get(str(cid))
+            if not iso: return None
+            dt = datetime.fromisoformat(iso)
+            return dt
+        except Exception:
+            return None
+
+    # helper: establecer bloqueo por destino (usar wait_seconds exacto + jitter)
+    def set_block_for_dest(cid: int, wait_seconds: int):
+        nonlocal paused_blocks
+        try:
+            jitter = random.uniform(1.0, 3.0)
+            until = datetime.now() + timedelta(seconds=int(wait_seconds) + int(jitter))
+            paused_blocks[str(cid)] = until.isoformat()
+            save_paused()
+            logger.debug(f"[{nombre}] set_block_for_dest {cid} until {until}")
+        except Exception:
+            logger.debug(f"[{nombre}] No se pudo persistir block_for_dest para {cid}")
+
     # autosave periódico
     async def autosave_state_loop():
         nonlocal last_forwarded, sent_counts
@@ -441,6 +560,8 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                 try:
                     save_last_forwarded(last_forwarded)
                     save_sent_counts(sent_counts)
+                    # guardar paused también periódicamente
+                    save_paused()
                 except Exception:
                     logger.debug(f"[{nombre}] autosave fallo: {traceback.format_exc()}")
                 await asyncio.sleep(SAVE_STATE_INTERVAL)
@@ -556,13 +677,25 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
     def is_paused(): return paused_until is not None and datetime.now() < paused_until
     def is_forwarding_paused(): return paused_forwarding_until is not None and datetime.now() < paused_forwarding_until
 
-    # Manejo robusto de FloodWait y errores
-    async def handle_floodwait(wait_seconds: int, reason: str = "", forward_action: bool = False):
-        nonlocal paused_until, paused_forwarding_until, flood_count, flood_window_start
+    # Manejo robusto de FloodWait y errores (ahora persiste bloqueo por destino si se provee dest_chat)
+    async def handle_floodwait(wait_seconds: int, reason: str = "", forward_action: bool = False, dest_chat: Optional[int] = None):
+        nonlocal paused_until, paused_forwarding_until, flood_count, flood_window_start, account_meta
         now = datetime.now()
         if (now - flood_window_start).total_seconds() > (30 * 60):
             flood_window_start = now; flood_count = 0
         flood_count += 1
+
+        # actualizar account_meta y persistir
+        account_meta['flood_count'] = flood_count
+        account_meta['flood_window_start'] = flood_window_start.isoformat()
+        # si supera cierto numero, suspender cuenta por SUSPEND_SECONDS
+        try:
+            if flood_count >= max(3, int(MAX_FLOOD_MULT)):
+                suspend_until_iso = (now + timedelta(seconds=SUSPEND_SECONDS)).isoformat()
+                account_meta['suspended_until'] = suspend_until_iso
+        except Exception:
+            pass
+        save_paused()
 
         extra = max(BASE_PAUSE_EXTRA_SEC, int(wait_seconds * 0.15))
         mult = 1.0 + min(flood_count * 0.3, MAX_FLOOD_MULT - 1.0)
@@ -573,6 +706,19 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
             paused_forwarding_until = until
         else:
             paused_until = until
+
+        # si hay destino, persistir bloqueo por destino usando el wait exacto (local)
+        if dest_chat is not None:
+            try:
+                set_block_for_dest(dest_chat, int(wait_seconds))
+            except Exception:
+                logger.debug(f"[{nombre}] No se pudo setear block_for_dest para {dest_chat}")
+            # --- ADICIONAL: setear bloqueo GLOBAL compartido ---
+            try:
+                set_global_block_for_dest(dest_chat, int(wait_seconds), max_cap_seconds=SUSPEND_SECONDS)
+            except Exception:
+                logger.debug(f"[{nombre}] No se pudo setear global block para {dest_chat}")
+
         save_paused()
         logger.warning(f"[{nombre}] Pausa por límite activada hasta {until} (motivo={reason}, wait={wait_seconds}s, mult={mult:.2f})")
         try:
@@ -764,7 +910,7 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
     # enviar publicaciones (FORWARD)
     async def enviar_publicaciones_local(account_start_offset: float = 0.0):
-        nonlocal paused_until, paused_forwarding_until, last_forwarded, sent_counts, recent_send_buffer
+        nonlocal paused_until, paused_forwarding_until, last_forwarded, sent_counts, recent_send_buffer, account_meta
         await asyncio.sleep(account_start_offset)
         if not SPAMMER_GROUP:
             logger.warning(f"[{nombre}] SPAMMER_GROUP no configurado. Saltando forwards.")
@@ -782,6 +928,20 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
         if not ALLOW_FORWARD:
             logger.info(f"[{nombre}] Forwarding deshabilitado (ALLOW_FORWARD=false)."); return
+
+        # si la cuenta está suspendida por exceso de FloodWaits, no hacemos forwards
+        try:
+            suspended_iso = account_meta.get('suspended_until')
+            if suspended_iso:
+                try:
+                    su = datetime.fromisoformat(suspended_iso)
+                    if su > datetime.now():
+                        logger.warning(f"[{nombre}] Cuenta suspendida hasta {su} por exceso de FloodWaits. No forwarding.")
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         dialog_cache = DialogCache(client, ttl_seconds=300)
         # *** Usar rate limiter específico para forwards para no forzar PER_ACCOUNT_MIN_INTERVAL ***
@@ -857,6 +1017,18 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                     if cm['sent_today'] >= CHAT_DAILY_LIMIT: continue
                     if cm['sent_round'] >= MAX_PUBS_PER_CHAT: continue
 
+                    # Si hay un bloqueo persistido por destino (LOCAL o GLOBAL), saltar
+                    block_dt = get_block_for_dest(cid)
+                    global_block_dt = None
+                    try:
+                        global_block_dt = get_global_block_for_dest(cid)
+                    except Exception:
+                        global_block_dt = None
+
+                    if (block_dt and block_dt > datetime.now()) or (global_block_dt and global_block_dt > datetime.now()):
+                        logger.info(f"[{nombre}] Skipping {cid} porque bloqueado (local={block_dt}, global={global_block_dt})")
+                        continue
+
                     skip = False
                     for mid in final_ids:
                         last = last_forwarded.get((cid, mid))
@@ -873,20 +1045,12 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                                     # intentamos batch primero
                                     await client.forward_messages(cid, final_ids, spam_entity)
                                 except errors.FloodWaitError as e:
-                                    # manejar flood (más conservador)
-                                    await handle_floodwait(e.seconds, f"reenviar batch -> {cid}", forward_action=True)
-                                    # intentar esperar y luego enviar per-message con delays
-                                    for mid in final_ids:
-                                        try:
-                                            await asyncio.sleep(random.uniform(PER_PUB_DELAY_MIN, PER_PUB_DELAY_MAX))
-                                            await client.forward_messages(cid, mid, spam_entity)
-                                        except errors.FloodWaitError as e2:
-                                            await handle_floodwait(e2.seconds, f"reenviar per-msg -> {cid}", forward_action=True)
-                                            break
-                                        except Exception as e_mid:
-                                            logger.warning(f"[{nombre}] fallo forward msg {mid} -> {cid}: {e_mid}")
+                                    # manejar flood: persistir bloqueo por destino y NO reintentar per-message aquí
+                                    await handle_floodwait(e.seconds, f"reenviar batch -> {cid}", forward_action=True, dest_chat=cid)
+                                    # romper del loop actual para respetar bloqueo; el while principal reintentará cuando corresponda
+                                    break
                                 except Exception as e_batch:
-                                    # intentar per-message si falla el batch
+                                    # intentar per-message si falla el batch por otra razón (no FloodWait)
                                     logger.debug(f"[{nombre}] batch forward falló a {cid}: {e_batch} — intentando per-message")
                                     for mid in final_ids:
                                         try:
@@ -920,12 +1084,12 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                                 await forward_rate_limiter.wait()
                                 await client.send_message(cid, footer)
                             except errors.FloodWaitError as f:
-                                await handle_floodwait(f.seconds, 'footer_after_forward', forward_action=True)
+                                await handle_floodwait(f.seconds, 'footer_after_forward', forward_action=True, dest_chat=cid)
                             except Exception:
                                 logger.debug(f"[{nombre}] No se pudo enviar footer a {cm['title']} ({cid})")
 
                     except errors.FloodWaitError as f:
-                        await handle_floodwait(f.seconds, f"reenviar a '{cm['title']}'", forward_action=True)
+                        await handle_floodwait(f.seconds, f"reenviar a '{cm['title']}'", forward_action=True, dest_chat=cid)
                         break
                     except Exception as e:
                         msg = str(e).lower()
@@ -944,7 +1108,7 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
                 # guardado periódico (no esperar al cierre)
                 if random.random() < 0.5:
-                    save_last_forwarded(last_forwarded); save_sent_counts(sent_counts)
+                    save_last_forwarded(last_forwarded); save_sent_counts(sent_counts); save_paused()
 
                 recent_send_buffer.clear()
 
@@ -1033,6 +1197,7 @@ async def main():
         if u['api_id'] and u['api_hash'] and u['phone']:
             nombre = f"Usuario{u['idx']}"
             tareas.append(asyncio.create_task(runner_wrapper(u['api_id'], u['api_hash'], u['phone'], nombre, known_account_ids, u['idx'])))
+
         else:
             logger.info(f"[Main] Credenciales incompletas para Usuario{u['idx']}, no se iniciará.")
     if not tareas:
