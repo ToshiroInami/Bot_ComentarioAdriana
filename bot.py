@@ -31,17 +31,17 @@ DEBUG_MODE = (sg("DEBUG_MODE") or "false").lower() in ("1","true","yes")
 LOG_FILE = sg("LOG_FILE") or "bot_optimizado.log"
 ALLOW_SEND = (sg("ALLOW_SEND") or "true").lower() in ("1","true","yes")
 ALLOW_FORWARD = (sg("ALLOW_FORWARD") or "true").lower() in ("1","true","yes")
-HANDLE = (sg("HANDLE") or "Yukochipro").strip().lstrip("@")
+HANDLE = (sg("HANDLE") or "BinsPeruDox").strip().lstrip("@")
 AT_HANDLE = f"@{HANDLE}"
 APPEND_HANDLE_TO_FORWARDS = (sg("APPEND_HANDLE_TO_FORWARDS") or "false").lower() in ("1","true","yes")
 FORWARD_ONLY_MEDIA = (sg("FORWARD_ONLY_MEDIA") or "true").lower() in ("1","true","yes")
 
 # Palabras, mensajes, logs
 PALABRAS_CLAVE = [k.strip() for k in (sg("PALABRAS_CLAVE") or "Arbol genealogico,titularidad,reniec,acta de nacimiento,seguidores,dox,ayuda,info,quien").split(",") if k.strip()]
-MSG_GRUPO = sg("MSG_GRUPO") or f"👋 {{mention}}, bienvenido al grupo, Tengo lo que buscas. Escríbeme por privado: {AT_HANDLE}"
-MSG_KEYWORD = sg("MSG_KEYWORD") or f"📌 {{mention}}, tengo justo lo que buscas. Escríbeme: {AT_HANDLE}"
-MSG_PRIVADO = sg("MSG_PRIVADO") or f"oyee vi tu mensaje en el grupo, que estas buscando?"
-MSG_AUTO = sg("MSG_AUTO") or f"Escríbeme a mi cuenta principal: {AT_HANDLE} - aquí estoy activo"
+MSG_GRUPO = sg("MSG_GRUPO") or f"👋 {{mention}}, bienvenido al grupo, Comunicate con el administrador: {AT_HANDLE}"
+MSG_KEYWORD = sg("MSG_KEYWORD") or f"📌 {{mention}}, Yo el administrador del grupo, Escríbeme: {AT_HANDLE}"
+MSG_PRIVADO = sg("MSG_PRIVADO") or f"Hola bro, que estas buscando?"
+MSG_AUTO = sg("MSG_AUTO") or f"Esta es la cuenta principal del ADMINISTRADOR DEL GRUPO: {AT_HANDLE} - "
 MSG_FORWARD_FOOTER = sg("MSG_FORWARD_FOOTER") or f"Más info: {AT_HANDLE}"
 SPAMMER_GROUP = sg("SPAMMER_GROUP")
 LOGS_CHANNEL = sg("LOGS_CHANNEL")
