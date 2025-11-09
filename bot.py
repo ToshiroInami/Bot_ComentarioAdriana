@@ -9,6 +9,9 @@ from typing import Optional, Dict, Set, List
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
+from telethon.errors.rpcerrorlist import SessionRevokedError
+from functools import wraps
+import logging
 from logging import getLogger, StreamHandler, Formatter, INFO
 from logging.handlers import RotatingFileHandler
 from filelock import FileLock, Timeout
@@ -133,6 +136,8 @@ fmt = Formatter(f'[%(asctime)s] %(levelname)s: %(message)s', "%Y-%m-%d %H:%M:%S"
 sh = StreamHandler(); sh.setFormatter(fmt); logger.addHandler(sh)
 rfh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding='utf-8')
 rfh.setFormatter(fmt); logger.addHandler(rfh)
+# reducir logs verbosos de telethon
+logging.getLogger("telethon").setLevel(logging.WARNING)
 logger.info(f"FLAGS: ALLOW_SEND={ALLOW_SEND} ALLOW_FORWARD={ALLOW_FORWARD} FORWARD_ONLY_MEDIA={FORWARD_ONLY_MEDIA} APPEND_HANDLE_TO_FORWARDS={APPEND_HANDLE_TO_FORWARDS}")
 
 class SimpleTelegramLogger:
@@ -599,6 +604,34 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
             while True:
                 try:
                     await client.get_me()
+                except SessionRevokedError as e:
+                    logger.warning(f"[{nombre}] Keepalive detectó SessionRevokedError: {e}")
+                    try:
+                        await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • Sesión invalidada/expirada (SessionRevoked): {e}", force=True)
+                    except Exception:
+                        pass
+                    # eliminar archivo de sesión local para evitar reusar sesión corrupta
+                    if not using_string_session:
+                        try:
+                            if os.path.exists(session_path):
+                                os.remove(session_path)
+                                logger.info(f"[{nombre}] Archivo de session eliminado: {session_path}")
+                        except Exception:
+                            logger.debug(f"[{nombre}] No se pudo eliminar session file: {traceback.format_exc()}")
+                    # eliminar string persistida también
+                    try:
+                        if os.path.exists(string_session_file):
+                            os.remove(string_session_file)
+                            logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                    except Exception:
+                        pass
+
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+                    raise UnauthorizedSession(f"Keepalive: sesión invalidada para {nombre}: {e}")
                 except Exception as e:
                     m = str(e).lower()
                     logger.debug(f"[{nombre}] Keepalive resultado: {m}")
@@ -608,7 +641,6 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                             await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • Sesión invalidada/expirada: {e}", force=True)
                         except Exception:
                             pass
-                        # eliminar archivo de sesión local para evitar reusar sesión corrupta
                         if not using_string_session:
                             try:
                                 if os.path.exists(session_path):
@@ -616,20 +648,16 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                                     logger.info(f"[{nombre}] Archivo de session eliminado: {session_path}")
                             except Exception:
                                 logger.debug(f"[{nombre}] No se pudo eliminar session file: {traceback.format_exc()}")
-                        # eliminar string persistida también
                         try:
                             if os.path.exists(string_session_file):
                                 os.remove(string_session_file)
                                 logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
                         except Exception:
                             pass
-
                         try:
                             await client.disconnect()
                         except Exception:
                             pass
-
-                        # lanzar excepción para que el runner lo gestione (no reintentar infinito)
                         raise UnauthorizedSession(f"Keepalive: sesión invalidada para {nombre}: {e}")
                     else:
                         logger.debug(f"[{nombre}] Keepalive error no crítico: {e}")
@@ -727,7 +755,44 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
         except Exception:
             pass
 
+    # decorador seguro para handlers de Telethon: captura SessionRevokedError y evita crash
+    def safe_handler(func):
+        @wraps(func)
+        async def wrapper(event, *args, **kwargs):
+            try:
+                return await func(event, *args, **kwargs)
+            except SessionRevokedError as e:
+                logger.warning(f"[{nombre}] SessionRevokedError en handler {func.__name__}: {e}")
+                try:
+                    await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • SessionRevokedError en handler {func.__name__}: {e}", force=True)
+                except Exception:
+                    pass
+                # eliminar archivos de session para forzar reauth manual
+                try:
+                    if os.path.exists(string_session_file):
+                        os.remove(string_session_file)
+                        logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                except Exception:
+                    pass
+                try:
+                    if not using_string_session and os.path.exists(session_path):
+                        os.remove(session_path)
+                        logger.info(f"[{nombre}] Archivo session removido: {session_path}")
+                except Exception:
+                    pass
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                # elevar para que runner deje de reintentar esta cuenta
+                raise UnauthorizedSession(f"Session revoked for {nombre}: {e}")
+            except Exception as e:
+                logger.exception(f"[{nombre}] Error inesperado en handler {func.__name__}: {e}")
+                return
+        return wrapper
+
     # bienvenida
+    @safe_handler
     async def bienvenida_por_join_local(event):
         try:
             if not getattr(event, 'is_group', False): return
@@ -765,6 +830,7 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
             logger.debug(f"[{nombre}] Error bienvenida: {e}")
 
     # Handler unificado
+    @safe_handler
     async def new_message_unificado(event):
         try:
             is_private = getattr(event, 'is_private', False)
@@ -1049,6 +1115,31 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                                     await handle_floodwait(e.seconds, f"reenviar batch -> {cid}", forward_action=True, dest_chat=cid)
                                     # romper del loop actual para respetar bloqueo; el while principal reintentará cuando corresponda
                                     break
+                                except SessionRevokedError as e:
+                                    # Si la sesión fue revocada mientras reenviábamos
+                                    logger.warning(f"[{nombre}] SessionRevokedError en forward batch: {e}")
+                                    try:
+                                        await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • SessionRevokedError en forward batch: {e}", force=True)
+                                    except Exception:
+                                        pass
+                                    # eliminar sesiones y forzar reauth
+                                    try:
+                                        if os.path.exists(string_session_file):
+                                            os.remove(string_session_file)
+                                            logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if not using_string_session and os.path.exists(session_path):
+                                            os.remove(session_path)
+                                            logger.info(f"[{nombre}] Archivo session removido: {session_path}")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await client.disconnect()
+                                    except Exception:
+                                        pass
+                                    raise UnauthorizedSession(f"Session revoked for {nombre}: {e}")
                                 except Exception as e_batch:
                                     # intentar per-message si falla el batch por otra razón (no FloodWait)
                                     logger.debug(f"[{nombre}] batch forward falló a {cid}: {e_batch} — intentando per-message")
@@ -1091,6 +1182,29 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
                     except errors.FloodWaitError as f:
                         await handle_floodwait(f.seconds, f"reenviar a '{cm['title']}'", forward_action=True, dest_chat=cid)
                         break
+                    except SessionRevokedError as e:
+                        logger.warning(f"[{nombre}] SessionRevokedError detectado en loop de forwarding: {e}")
+                        try:
+                            await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • SessionRevokedError en forwarding: {e}", force=True)
+                        except Exception:
+                            pass
+                        try:
+                            if os.path.exists(string_session_file):
+                                os.remove(string_session_file)
+                                logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                        except Exception:
+                            pass
+                        try:
+                            if not using_string_session and os.path.exists(session_path):
+                                os.remove(session_path)
+                                logger.info(f"[{nombre}] Archivo session removido: {session_path}")
+                        except Exception:
+                            pass
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        raise UnauthorizedSession(f"Session revoked for {nombre}: {e}")
                     except Exception as e:
                         msg = str(e).lower()
                         if "forbidden" in msg or "chatwriteforbidden" in msg:
@@ -1123,6 +1237,29 @@ async def iniciar_usuario(api_id: int, api_hash: str, phone: str, nombre: str, k
 
             except errors.FloodWaitError as f:
                 await handle_floodwait(f.seconds, 'forward_loop', forward_action=True)
+            except SessionRevokedError as e:
+                logger.warning(f"[{nombre}] SessionRevokedError en enviar_publicaciones_local: {e}")
+                try:
+                    await tlg_logger.send(LOGS_CHANNEL, f"{nombre} • SessionRevokedError en enviar_publicaciones_local: {e}", force=True)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(string_session_file):
+                        os.remove(string_session_file)
+                        logger.info(f"[{nombre}] Archivo STRING_SESSION removido: {string_session_file}")
+                except Exception:
+                    pass
+                try:
+                    if not using_string_session and os.path.exists(session_path):
+                        os.remove(session_path)
+                        logger.info(f"[{nombre}] Archivo session removido: {session_path}")
+                except Exception:
+                    pass
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise UnauthorizedSession(f"Session revoked for {nombre}: {e}")
             except Exception as e:
                 logger.exception(f"[{nombre}] Error en loop de forwarding: {e}")
                 await asyncio.sleep(10 + random.uniform(0, 10))
